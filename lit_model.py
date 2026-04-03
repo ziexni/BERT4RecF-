@@ -1,4 +1,4 @@
-import pytorch_lightning as pl # 모델 + 학습 로직 관리
+import pytorch_lightning as pl
 from torchmetrics import RetrievalHitRate, RetrievalNormalizedDCG, RetrievalMRR
 import torch
 import torch.nn as nn
@@ -6,70 +6,82 @@ import numpy as np
 
 from bert import BERT
 
-class BERT4REC(pl.LightningModule):
+
+class BERT4RecFPlus(pl.LightningModule):
+    """
+    BERT4RecF+ - BERT4Rec with Multimodal Fusion
+    """
     def __init__(self, args):
-        super(BERT4REC, self).__init__()
+        super(BERT4RecFPlus, self).__init__()
 
-        # 기본 하이퍼파라미터
-        self.learning_rate = args.learning_rate         # optimizer learning rate
-        self.max_len = args.max_len                      # sequence 길이
-        self.hidden_dim = args.hidden_dim               # transformer hidden_dimension
-        self.encoder_num = args.encoder_num             # transformer layer 수
-        self.head_num = args.head_num                   # multi-head attention head 수
-        self.dropout_rate = args.dropout_rate           # FFN dropout
-        self.dropout_rate_attn = args.dropout_rate_attn # attention dropout
+        # Hyperparameters
+        self.learning_rate = args.learning_rate
+        self.max_len = args.max_len
+        self.hidden_dim = args.hidden_dim
+        self.encoder_num = args.encoder_num
+        self.head_num = args.head_num
+        self.dropout_rate = args.dropout_rate
+        self.dropout_rate_attn = args.dropout_rate_attn
 
-        # vocab 구성 (0: PAD / 1 ~ itemsize: 실제 item / item_size + 1: MASK token)
+        # Vocab: 0=PAD, 1~item_size=items, item_size+1=MASK
         self.vocab_size = args.item_size + 2
 
-        self.initializer_range= args.initializer_range  # weight init 범위
-        self.weight_decay = args.weight_decay           # L2 regularization
-        self.decay_step = args.decay_step               # Lr scheduler step
-        self.gamma = args.gamma                         # lr 감소 비율
+        self.initializer_range = args.initializer_range
+        self.weight_decay = args.weight_decay
+        self.decay_step = args.decay_step
+        self.gamma = args.gamma
 
-        # BERT encoder : sequence -> contextualized embedding 생성
+        # Multimodal
+        self.use_multimodal = args.use_multimodal
+
+        # BERT encoder with multimodal fusion
         self.model = BERT(
-            vocab_size = self.vocab_size,
-            max_len = self.max_len,
-            hidden_dim = self.hidden_dim,
-            encoder_num = self.encoder_num,
-            head_num = self.head_num,
-            dropout_rate = self.dropout_rate,
-            dropout_rate_attn = self.dropout_rate_attn,
-            initializer_range = self.initializer_range
+            vocab_size=self.vocab_size,
+            max_len=self.max_len,
+            hidden_dim=self.hidden_dim,
+            encoder_num=self.encoder_num,
+            head_num=self.head_num,
+            dropout_rate=self.dropout_rate,
+            dropout_rate_attn=self.dropout_rate_attn,
+            initializer_range=self.initializer_range,
+            # Multimodal
+            text_dim=args.text_dim if self.use_multimodal else 0,
+            image_dim=args.image_dim if self.use_multimodal else 0,
+            category_dim=args.category_dim if self.use_multimodal else 0,
+            use_multimodal=self.use_multimodal
         )
 
-        # output head : (B, T, hidden_dim) -> (B, T, item_size + 1)
+        # Output head
         self.out = nn.Linear(self.hidden_dim, args.item_size + 1)
 
         self.batch_size = args.batch_size
 
-        # loss (ignore_index = 0 -> PAD는 loss 계산에서 제외)
+        # Loss (ignore_index=0 for PAD)
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
 
-        # 평가 metric
-        self.HR   = RetrievalHitRate(top_k=10)
+        # Metrics
+        self.HR = RetrievalHitRate(top_k=10)
         self.NDCG = RetrievalNormalizedDCG(top_k=10)
-        self.MRR  = RetrievalMRR()     
+        self.MRR = RetrievalMRR()
 
     def training_step(self, batch, batch_idx):
         """
-        BERT4REC 학습 단계
-
-        batch:
-            seq : input sequence (mask 포함)
-            labels : 정답 item (mask 위치만 값 있음, 나머지는 0)
+        Training step with optional multimodal features
         """
+        if self.use_multimodal:
+            seq, labels, text_feat, image_feat, category_feat = batch
+            logits = self.model(seq, text_feat=text_feat, 
+                               image_feat=image_feat, 
+                               category_feat=category_feat)
+        else:
+            seq, labels = batch
+            logits = self.model(seq)
 
-        seq, labels = batch
-
-        logits = self.model(seq)  # (B, T, hidden)
         preds = self.out(logits)  # (B, T, item_size + 1)
 
-        # CrossEntropyLoss 입력 형태 맞추기 위해 transpose
+        # CrossEntropyLoss
         loss = self.criterion(preds.transpose(1, 2), labels)
 
-        # 로그 기록
         self.log("train_loss", loss,
                  on_step=True, on_epoch=True,
                  prog_bar=True, logger=True)
@@ -78,31 +90,36 @@ class BERT4REC(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         """
-        validation 단계 (ranking 기반 평가)
-
-        batch:
-            seq : input sequence
-            candidate : [정답 + negative items] (B, 101)
-            labels : 정답 위치 (one-hot 형태)
+        Validation step with ranking evaluation
         """
-        seq, candidates, labels = batch
+        if self.use_multimodal:
+            (seq, candidates, labels,
+             text_seq, image_seq, category_seq,
+             text_cand, image_cand, category_cand) = batch
+            
+            # Encode sequence
+            logits = self.model(seq, text_feat=text_seq,
+                               image_feat=image_seq,
+                               category_feat=category_seq)
+        else:
+            seq, candidates, labels = batch
+            logits = self.model(seq)
 
-        logits = self.model(seq)
         preds = self.out(logits)
 
-        # 마지막 위치 prediction : BERT4REC은 마지막 mask 위치만 평가
-        preds = preds[:, -1, :] # (B, item_size + 1)
+        # Last position prediction
+        preds = preds[:, -1, :]  # (B, item_size + 1)
         
-        # 정답 item id
+        # Target item
         targets = candidates[:, 0]
 
-        # classification loss (참고용)
+        # Classification loss
         loss = self.criterion(preds, targets)
 
-        # candidate subset score 추출
+        # Candidate scores
         recs = torch.gather(preds, 1, candidates)
 
-        # metrics 계산용 index 생성
+        # Indexes for metrics
         steps = batch_idx * self.batch_size
         indexes = torch.arange(
             steps, steps + seq.size(0),
@@ -110,7 +127,7 @@ class BERT4REC(pl.LightningModule):
             device=seq.device
         ).unsqueeze(1).repeat(1, 101)
 
-                # ===== logging =====
+        # Logging
         self.log("val_loss", loss,
                  on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
@@ -128,20 +145,29 @@ class BERT4REC(pl.LightningModule):
         
     def test_step(self, batch, batch_idx):
         """
-        test 단계 (validation과 동일 구조)
+        Test step (same as validation)
         """
-        seq, candidates, labels = batch
+        if self.use_multimodal:
+            (seq, candidates, labels,
+             text_seq, image_seq, category_seq,
+             text_cand, image_cand, category_cand) = batch
+            
+            logits = self.model(seq, text_feat=text_seq,
+                               image_feat=image_seq,
+                               category_feat=category_seq)
+        else:
+            seq, candidates, labels = batch
+            logits = self.model(seq)
 
-        logits = self.model(seq)
-        preds  = self.out(logits)
+        preds = self.out(logits)
 
-        preds   = preds[:, -1, :]
+        preds = preds[:, -1, :]
         targets = candidates[:, 0]
-        loss    = self.criterion(preds, targets)
+        loss = self.criterion(preds, targets)
 
         recs = torch.gather(preds, 1, candidates)
 
-        steps   = batch_idx * self.batch_size
+        steps = batch_idx * self.batch_size
         indexes = torch.arange(
             steps, steps + seq.size(0),
             dtype=torch.long,
@@ -165,46 +191,48 @@ class BERT4REC(pl.LightningModule):
         
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         """
-        inference (추천 결과 생성)
-
-        입력 : seq
-        출력 : top-10 item index
+        Inference - top-10 item recommendations
         """
-        seq = batch
+        if self.use_multimodal:
+            seq, text_feat, image_feat, category_feat = batch
+            logits = self.model(seq, text_feat=text_feat,
+                               image_feat=image_feat,
+                               category_feat=category_feat)
+        else:
+            seq = batch
+            logits = self.model(seq)
 
-        logits = self.model(seq)
         preds = self.out(logits)
+        preds = preds[:, -1, :]  # Last position
 
-        preds = preds[:, -1, :] # 마지막 step 기준 추천
-
-        # top-10 추천
+        # Top-10
         indexes, _ = torch.topk(preds, 10)
 
         return indexes.cpu().numpy()
     
     def configure_optimizers(self):
         """
-        optimizer + scheduler 설정
+        Optimizer + scheduler
         """
-        # weight decay 적응 분리
+        # Weight decay separation
         no_decay = ['bias', 'LayerNorm.weight']
 
         params = [
             {
-                'params' : [p for n, p in self.named_parameters()
-                            if not any(nd in n for nd in no_decay)],
-                'weight_decay' : self.weight_decay
+                'params': [p for n, p in self.named_parameters()
+                          if not any(nd in n for nd in no_decay)],
+                'weight_decay': self.weight_decay
             },
             {
-                'params' : [p for n, p in self.named_parameters()
-                            if any(nd in n for nd in no_decay)],
-                'weight_decay' : 0.0
+                'params': [p for n, p in self.named_parameters()
+                          if any(nd in n for nd in no_decay)],
+                'weight_decay': 0.0
             }
         ]
 
         optimizer = torch.optim.Adam(params, lr=self.learning_rate)
 
-        # Learning rate decay
+        # Learning rate scheduler
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
             step_size=self.decay_step,
@@ -219,17 +247,14 @@ class BERT4REC(pl.LightningModule):
     
     @staticmethod
     def add_to_argparse(parser):
-        """
-        CLI argument 정의
-        """
-        parser.add_argument("--learning_rate",     type=float, default=1e-3)
-        parser.add_argument("--hidden_dim",        type=int,   default=256)
-        parser.add_argument("--encoder_num",       type=int,   default=2)
-        parser.add_argument("--head_num",          type=int,   default=4)
-        parser.add_argument("--dropout_rate",      type=float, default=0.1)
+        parser.add_argument("--learning_rate", type=float, default=1e-3)
+        parser.add_argument("--hidden_dim", type=int, default=256)
+        parser.add_argument("--encoder_num", type=int, default=2)
+        parser.add_argument("--head_num", type=int, default=4)
+        parser.add_argument("--dropout_rate", type=float, default=0.1)
         parser.add_argument("--dropout_rate_attn", type=float, default=0.1)
         parser.add_argument("--initializer_range", type=float, default=0.02)
-        parser.add_argument("--weight_decay",      type=float, default=0.01)
-        parser.add_argument("--decay_step",        type=int,   default=25)
-        parser.add_argument("--gamma",             type=float, default=0.1)
+        parser.add_argument("--weight_decay", type=float, default=0.01)
+        parser.add_argument("--decay_step", type=int, default=25)
+        parser.add_argument("--gamma", type=float, default=0.1)
         return parser
