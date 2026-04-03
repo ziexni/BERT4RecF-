@@ -1,9 +1,7 @@
 import argparse
 import datetime
-
 from datamodule import DataModule
 from lit_model import BERT4RecFPlus
-
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
@@ -39,9 +37,9 @@ def _set_trainer_args(args):
     args.save_dir = "Training/logs/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     args.name = f"{model_name}_MicroVideo"
     
-    # Early stopping
-    args.monitor = "val_loss"
-    args.mode = "min"
+    # Early stopping & Checkpoint - NDCG 기준 (다른 베이스라인과 동일)
+    args.monitor = "NDCG_val"
+    args.mode = "max"
     args.patience = 5
     
     # Logging interval
@@ -87,8 +85,8 @@ def main():
     )
     
     checkpoint = ModelCheckpoint(
-        monitor='val_loss',
-        mode='min',
+        monitor='NDCG_val',
+        mode='max',
         save_top_k=1,
         filename='best'
     )
