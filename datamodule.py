@@ -126,10 +126,10 @@ class DataModule(pl.LightningDataModule):
     
     @staticmethod    
     def add_to_argparse(parser):
-        parser.add_argument('--max_len', type=int, default=100)
+        parser.add_argument('--max_len', type=int, default=50)
         parser.add_argument('--mask_prob', type=float, default=0.2)
         parser.add_argument('--neg_sample_size', type=int, default=100)
-        parser.add_argument('--batch_size', type=int, default=64)
+        parser.add_argument('--batch_size', type=int, default=128)
         parser.add_argument('--pin_memory', type=bool, default=True)
         parser.add_argument('--num_workers', type=int, default=4)
         parser.add_argument('--item_size', type=int, default=0)
